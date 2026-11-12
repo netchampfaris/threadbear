@@ -28,9 +28,13 @@ pub struct Account {
     pub models: Vec<ModelChoice>,
     pub default_effort: Option<String>,
     pub email: Option<String>,
+    /// "Max", "Team", "Pro Lite": the Usage panel's tip on a login.
+    pub plan: Option<String>,
     pub note: Option<String>,
     /// Kept as it came (AccountUsage), for the badge a later slice draws.
     pub usage: Option<Value>,
+    /// Where the login's CLI keeps its sign-in, for Sign in… (sign_in.rs).
+    pub config_dir: String,
 }
 
 impl Account {
@@ -100,25 +104,17 @@ pub struct RunnerLogins {
 
 impl RunnerLogins {
     pub fn from_hello(hello: &Value) -> RunnerLogins {
-        let mut accounts: Vec<Account> = lossy(&hello["accounts"]);
-        for account in &mut accounts {
-            for model in &mut account.models {
-                // `model` and `title` fall back to the id (ModelChoice.init).
-                if model.model.is_empty() {
-                    model.model = model.id.clone();
-                }
-                if model.title.is_empty() {
-                    model.title = model.id.clone();
-                }
-            }
-        }
-        let mut pools: Vec<Pool> = lossy(&hello["pools"]);
-        for pool in &mut pools {
-            if pool.title.is_empty() {
-                pool.title = pool.id.clone();
-            }
-        }
-        RunnerLogins { accounts, pools, defaults: serde_json::from_value(hello["defaults"].clone()).unwrap_or_default() }
+        RunnerLogins { accounts: accounts_from(&hello["accounts"]), pools: pools_from(&hello["pools"]), defaults: serde_json::from_value(hello["defaults"].clone()).unwrap_or_default() }
+    }
+
+    /// `accounts.updated`: the logins, which replace the ones from `hello`.
+    pub fn set_accounts(&mut self, accounts: &Value) {
+        self.accounts = accounts_from(accounts);
+    }
+
+    /// `pools.updated`: the pools, which replace the ones from `hello`.
+    pub fn set_pools(&mut self, pools: &Value) {
+        self.pools = pools_from(pools);
     }
 
     pub fn account(&self, id: &str) -> Option<&Account> {
@@ -134,6 +130,32 @@ impl RunnerLogins {
     pub fn uses_pools(&self) -> bool {
         !self.pools.is_empty()
     }
+}
+
+fn accounts_from(v: &Value) -> Vec<Account> {
+    let mut accounts: Vec<Account> = lossy(v);
+    for account in &mut accounts {
+        for model in &mut account.models {
+            // `model` and `title` fall back to the id (ModelChoice.init).
+            if model.model.is_empty() {
+                model.model = model.id.clone();
+            }
+            if model.title.is_empty() {
+                model.title = model.id.clone();
+            }
+        }
+    }
+    accounts
+}
+
+fn pools_from(v: &Value) -> Vec<Pool> {
+    let mut pools: Vec<Pool> = lossy(v);
+    for pool in &mut pools {
+        if pool.title.is_empty() {
+            pool.title = pool.id.clone();
+        }
+    }
+    pools
 }
 
 fn lossy<T: serde::de::DeserializeOwned>(v: &Value) -> Vec<T> {
@@ -331,6 +353,23 @@ impl<'a> ChipSettings<'a> {
     }
 
     /// The model chip (ThreadSettings.modelChipTitle): "Claude · Fable 5.1 · High".
+    /// `ThreadSettings.modelChipBadge`: with pools, the pool's badge when
+    /// every login in it is running out, or a pinned login's own.
+    pub fn model_chip_badge(&self) -> Option<crate::new_thread::ChipBadge> {
+        if !self.uses_pools() {
+            return None;
+        }
+        match self.pool() {
+            Some(pool) => crate::new_thread::pool_chip_badge(pool, &self.logins.accounts),
+            None => crate::new_thread::chip_badge(self.logins.account(&self.account)),
+        }
+    }
+
+    /// `ThreadSettings.accountBadge`: the account chip's "· 12%" or "Limit reached".
+    pub fn account_badge(&self) -> Option<crate::new_thread::ChipBadge> {
+        crate::new_thread::chip_badge(self.logins.account(&self.account))
+    }
+
     pub fn model_chip_title(&self) -> String {
         let rest = chip_title(self.effective_model().as_deref(), self.effective_effort().as_deref(), self.choices());
         match self.owner().filter(|o| !o.is_empty()) {
@@ -432,11 +471,24 @@ pub fn permission_help(mode: &str) -> &'static str {
     }
 }
 
+/// What tells a login apart when another of its provider has the same
+/// email (two config folders signed in to one account, issue 18): its
+/// note, else its id. None when its email is its own.
+pub fn twin_label(account: &Account, accounts: &[Account]) -> Option<String> {
+    let email = account.email.as_deref().map(|e| e.trim().to_lowercase()).filter(|e| !e.is_empty())?;
+    let twin = accounts.iter().any(|a| a.id != account.id && a.provider_id() == account.provider_id() && a.email.as_deref().map(|e| e.trim().to_lowercase()).as_deref() == Some(email.as_str()));
+    twin.then(|| account.note.as_deref().map(str::trim).filter(|n| !n.is_empty()).map_or_else(|| account.id.clone(), str::to_owned))
+}
+
 /// AccountName.short: the part of a Claude email before the @, unless
 /// another Claude account shares it; "Codex", or "Codex sam.lee" if there
-/// are several.
+/// are several. A login whose whole email another shares goes by its note
+/// or id (twin_label).
 pub fn short_account_name(id: &str, accounts: &[Account]) -> String {
     let Some(account) = accounts.iter().find(|a| a.id == id) else { return id.to_owned() };
+    if let Some(label) = twin_label(account, accounts) {
+        return label;
+    }
     let full = account.name();
     let local = |s: &str| s.split('@').next().unwrap_or(s).to_owned();
     let siblings: Vec<&Account> = accounts.iter().filter(|a| a.id != id && a.provider_id() == account.provider_id()).collect();
@@ -543,5 +595,16 @@ mod tests {
         assert_eq!(short_account_name("codex-main", &l.accounts), "Codex");
         assert_eq!(l.account("claude-main").unwrap().name(), "mike@example.com");
         assert_eq!(l.account("codex-main").unwrap().name(), "sam@example.com");
+    }
+
+    #[test]
+    fn two_logins_with_one_email_go_by_note_or_id() {
+        let a = |id: &str, email: &str, note: Option<&str>| Account { id: id.into(), provider: "claude".into(), email: Some(email.into()), note: note.map(Into::into), ..Default::default() };
+        let accounts = vec![a("claude-main", "mike@example.com", None), a("claude-2", "Mike@Example.com", Some("Hooks")), a("claude-3", "sam@example.com", None)];
+        assert_eq!(twin_label(&accounts[0], &accounts).as_deref(), Some("claude-main"));
+        assert_eq!(twin_label(&accounts[1], &accounts).as_deref(), Some("Hooks"));
+        assert_eq!(twin_label(&accounts[2], &accounts), None);
+        assert_eq!(short_account_name("claude-2", &accounts), "Hooks");
+        assert_eq!(short_account_name("claude-3", &accounts), "sam");
     }
 }
